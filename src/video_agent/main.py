@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import datetime
+import shutil
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -18,7 +19,7 @@ from src.video_agent.models.schemas import VideoAnnotation, AnnotationResult, Ta
 from src.video_agent.utils.mcp_client import MCPClient
 
 # Configure logging
-def setup_logging():
+def setup_logging() -> None:
     """Configures logging based on settings."""
     log_format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
     
@@ -37,27 +38,26 @@ logger = logging.getLogger(__name__)
 
 def process_single_video(video_path: str, ai_client: MCPClient) -> VideoAnnotation:
     """
-    Processes a single video: extracts info/frames and analyzes with AI.
-    This function is designed to be run in a thread pool.
+    处理单个视频
     
     Args:
-        video_path: Path to the video file.
-        ai_client: A shared AI client instance (OpenAI or MCP) for thread-safety.
-        
+        video_path: 视频文件路径
+        ai_client: MCP客户端实例
+    
     Returns:
-        A VideoAnnotation object.
+        视频标注结果
     """
+    temp_dir = None
+    
     try:
         # Step 1: Video Processing (Preprocessing)
         video_data = process_video_file(video_path)
+        temp_dir = video_data.get("temp_dir")
         
         # Step 2: AI Analysis
-        # If video is abnormal, we might skip AI analysis or use a simpler prompt.
-        # The ai_analyzer handles this based on video_data.
         ai_result = analyze_video_with_ai(video_data, client=ai_client)
         
         # Step 3: Construct VideoAnnotation
-        # Validate tags against TagEnum
         validated_tags = []
         for tag_str in ai_result.get("tags", []):
             try:
@@ -65,7 +65,6 @@ def process_single_video(video_path: str, ai_client: MCPClient) -> VideoAnnotati
             except ValueError:
                 logger.warning(f"Tag '{tag_str}' not recognized for {video_path}. Skipping.")
         
-        # If video was marked abnormal by video_processor, ensure tag is 'abnormal_video'
         if video_data.get("is_abnormal"):
             validated_tags = [TagEnum.ABNORMAL_VIDEO]
         
@@ -83,14 +82,14 @@ def process_single_video(video_path: str, ai_client: MCPClient) -> VideoAnnotati
         
     except AIAnalysisError as e:
         logger.error(f"AI Analysis failed for {video_path}: {e}")
-        # Return a failed annotation if AI fails, to keep count correct
         return VideoAnnotation(
             file_path=video_path,
             description="AI Analysis Failed",
-            tags=[TagEnum.ABNORMAL_VIDEO], # Treat as abnormal
+            tags=[TagEnum.ABNORMAL_VIDEO],
             duration_seconds=None,
             is_abnormal=True,
-            abnormality_reason=f"AI Analysis Error: {e}"
+            abnormality_reason=f"AI Analysis Error: {e}",
+            confidence_scores=None
         )
     except Exception as e:
         logger.error(f"Unexpected error processing {video_path}: {e}", exc_info=True)
@@ -100,17 +99,41 @@ def process_single_video(video_path: str, ai_client: MCPClient) -> VideoAnnotati
             tags=[TagEnum.ABNORMAL_VIDEO],
             duration_seconds=None,
             is_abnormal=True,
-            abnormality_reason=f"Unexpected Error: {e}"
+            abnormality_reason=f"Unexpected Error: {e}",
+            confidence_scores=None
         )
+    finally:
+        # 清理临时文件
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e}")
 
-def main(input_directory: str, output_json_path: Optional[str] = None, max_workers: int = 5):
+def main(input_directory: str, output_json_path: Optional[str] = None, max_workers: int = 5) -> None:
     """
-    Main execution function.
+    主执行函数：处理视频文件并生成标注结果
+    
+    工作流程：
+    1. 查找输入目录中的所有视频文件
+    2. 初始化MCP客户端
+    3. 并发处理视频文件（提取关键帧、AI分析）
+    4. 聚合结果并保存到JSON文件
     
     Args:
-        input_directory: Directory containing video files.
-        output_json_path: Path to save the output JSON. If None, uses default.
-        max_workers: Maximum number of concurrent threads for video processing.
+        input_directory: 包含视频文件的输入目录
+        output_json_path: 输出JSON文件路径。如果为None，使用默认路径
+        max_workers: 并发处理的最大线程数
+    
+    Returns:
+        None
+    
+    Raises:
+        无显式异常抛出，但会在日志中记录错误
+    
+    Example:
+        >>> main("data/input", "data/output/results.json", max_workers=5)
     """
     start_time = datetime.datetime.utcnow()
     
@@ -143,16 +166,16 @@ def main(input_directory: str, output_json_path: Optional[str] = None, max_worke
 
     # Step 2: Process videos concurrently
     annotations = []
+    successful_count = 0
+    abnormal_count = 0
     failed_count = 0
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Create a future for each video file
         future_to_video = {
             executor.submit(process_single_video, video_path, ai_client): video_path
             for video_path in video_files
         }
         
-        # Use tqdm to show progress
         with tqdm(total=len(video_files), desc="Processing Videos", unit="video") as pbar:
             for future in as_completed(future_to_video):
                 video_path = future_to_video[future]
@@ -160,27 +183,27 @@ def main(input_directory: str, output_json_path: Optional[str] = None, max_worke
                     annotation = future.result()
                     annotations.append(annotation)
                     
-                    # Update progress bar description based on status
                     if annotation.is_abnormal:
-                        pbar.set_postfix_str(f"Success: {len(annotations) - failed_count}, Abnormal: {failed_count}")
+                        if annotation.abnormality_reason and "AI Analysis" in annotation.abnormality_reason:
+                            failed_count += 1
+                            logger.warning(f"AI analysis failed: {annotation.file_path} - {annotation.abnormality_reason}")
+                        else:
+                            abnormal_count += 1
+                            logger.debug(f"Video abnormal: {annotation.file_path} - {annotation.abnormality_reason}")
                     else:
-                        pbar.set_postfix_str(f"Success: {len(annotations) - failed_count}, Failed: {failed_count}")
-                        
-                    pbar.update(1)
+                        successful_count += 1
                     
-                    # Log abnormal videos specifically
-                    if annotation.is_abnormal:
-                        failed_count += 1
-                        logger.debug(f"Marked abnormal: {annotation.file_path} - {annotation.abnormality_reason}")
+                    pbar.set_postfix_str(f"✓{successful_count} ⚠{abnormal_count} ✗{failed_count}")
+                    pbar.update(1)
                         
                 except Exception as e:
-                    logger.error(f"Exception in future for {video_path}: {e}")
+                    logger.error(f"Exception in future for {video_path}: {e}", exc_info=True)
                     failed_count += 1
+                    pbar.set_postfix_str(f"✓{successful_count} ⚠{abnormal_count} ✗{failed_count}")
                     pbar.update(1)
 
     # Step 3: Aggregate results into AnnotationResult
     end_time = datetime.datetime.utcnow()
-    successful_count = len(annotations) - failed_count
     
     try:
         final_result = AnnotationResult(
@@ -194,7 +217,12 @@ def main(input_directory: str, output_json_path: Optional[str] = None, max_worke
                 "ai_provider": "MCP (GLM4.6v)",
                 "model": "GLM4.6v",
                 "max_workers": max_workers,
-                "input_directory": input_directory
+                "input_directory": input_directory,
+                "statistics": {
+                    "successful": successful_count,
+                    "abnormal_videos": abnormal_count,
+                    "failed_analyses": failed_count
+                }
             }
         )
         
@@ -208,8 +236,9 @@ def main(input_directory: str, output_json_path: Optional[str] = None, max_worke
         
         logger.info(f"\nProcessing Complete!")
         logger.info(f"Total Videos: {final_result.total_videos_processed}")
-        logger.info(f"Successful: {final_result.successful_annotations}")
-        logger.info(f"Failed/Abnormal: {final_result.failed_annotations}")
+        logger.info(f"Successful: {successful_count}")
+        logger.info(f"Abnormal Videos: {abnormal_count}")
+        logger.info(f"Failed Analyses: {failed_count}")
         logger.info(f"Duration: {end_time - start_time}")
         logger.info(f"Results saved to: {output_json_path}")
         

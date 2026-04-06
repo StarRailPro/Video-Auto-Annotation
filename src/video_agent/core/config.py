@@ -54,41 +54,70 @@ class Settings(BaseSettings):
     @classmethod
     def parse_supported_video_extensions(cls, v):
         if isinstance(v, str):
-            # Parse comma-separated string
             return [ext.strip() for ext in v.split(',')]
         return v
 
+    @staticmethod
+    def _find_env_file() -> Optional[Path]:
+        """
+        查找.env文件，使用多种策略
+        
+        查找策略（按优先级）：
+        1. 环境变量 DOTENV_PATH
+        2. 从当前文件向上查找，直到找到项目根目录标记
+        3. 从当前工作目录向上查找
+        4. 返回None（使用环境变量）
+        
+        Returns:
+            .env文件的路径，如果找不到则返回None
+        """
+        logger = __import__('logging').getLogger(__name__)
+        
+        env_var_path = os.getenv('DOTENV_PATH')
+        if env_var_path:
+            env_path = Path(env_var_path)
+            if env_path.exists():
+                logger.debug(f"Found .env via DOTENV_PATH: {env_path}")
+                return env_path
+            else:
+                logger.warning(f"DOTENV_PATH set but file not found: {env_path}")
+        
+        current_file = Path(__file__).resolve()
+        for parent in current_file.parents:
+            candidate = parent / ".env"
+            if candidate.exists():
+                logger.debug(f"Found .env by walking up from config.py: {candidate}")
+                return candidate
+            
+            if (parent / "pyproject.toml").exists() or (parent / ".git").exists():
+                logger.debug(f"Reached project root at: {parent}")
+                break
+        
+        cwd = Path.cwd()
+        for parent in [cwd] + list(cwd.parents):
+            candidate = parent / ".env"
+            if candidate.exists():
+                logger.debug(f"Found .env by walking up from cwd: {candidate}")
+                return candidate
+        
+        logger.debug("No .env file found, will use environment variables only")
+        return None
+
     def __init__(self, **kwargs):
-        # Load .env file manually BEFORE calling super().__init__()
-        # The .env file is in the project root (VedioAutoMark)
-        # __file__ is at src/video_agent/core/config.py
-        # We need to go up 4 levels to reach VedioAutoMark
-        env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+        env_path = self._find_env_file()
         
-        # Fallback: try current directory if the above doesn't work
-        if not env_path.exists():
-            # Try to find .env in the current working directory or parent directories
-            cwd = Path.cwd()
-            for parent in [cwd] + list(cwd.parents):
-                candidate = parent / ".env"
-                if candidate.exists():
-                    env_path = candidate
-                    break
-        
-        if env_path.exists():
+        if env_path and env_path.exists():
             load_dotenv(env_path, encoding="utf-8")
+            logger = __import__('logging').getLogger(__name__)
+            logger.info(f"✓ Loaded .env file from: {env_path}")
         
-        # Now initialize parent (Pydantic) which will read from environment variables
         super().__init__(**kwargs)
-        # Ensure output directory exists
         os.makedirs(self.output_json_directory, exist_ok=True)
-        # Ensure input directory exists (or at least, its parent)
         os.makedirs(self.input_video_directory, exist_ok=True)
         
-        # Validate configuration
         logger = __import__('logging').getLogger(__name__)
         if not self.mcp_zai_api_key or self.mcp_zai_api_key == "":
-            logger.warning(f"MCP API key is not configured. Please check your .env file at: {env_path}")
+            logger.warning(f"MCP API key is not configured. Please check your .env file")
         else:
             logger.info("Using MCP (GLM4.6v) for AI analysis")
 

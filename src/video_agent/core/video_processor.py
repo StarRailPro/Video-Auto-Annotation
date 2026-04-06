@@ -1,6 +1,9 @@
 import cv2
 import os
 import logging
+import tempfile
+import shutil
+import hashlib
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 from pathlib import Path
@@ -86,79 +89,110 @@ def is_video_abnormal(video_path: str, video_info: Dict[str, Any]) -> Tuple[bool
 
     return False, None
 
-def extract_keyframes(video_path: str, num_frames: int) -> List[str]:
+def extract_keyframes(
+    video_path: str, 
+    num_frames: int,
+    output_dir: Optional[str] = None
+) -> Tuple[List[str], Optional[str]]:
     """
-    Extracts a specified number of keyframes from a video.
-    Frames are extracted at regular intervals.
-
+    提取关键帧
+    
     Args:
-        video_path: The path to the video file.
-        num_frames: The number of keyframes to extract.
-
+        video_path: 视频文件路径
+        num_frames: 要提取的关键帧数量
+        output_dir: 输出目录（如果为None，使用临时目录）
+    
     Returns:
-        A list of file paths to the extracted keyframe images (as JPEG).
-        Returns an empty list if the video cannot be opened or extraction fails.
+        (keyframe_paths, temp_dir):
+            - keyframe_paths: 关键帧文件路径列表
+            - temp_dir: 临时目录路径（如果使用了临时目录），否则为None
+    
+    Example:
+        # 使用临时目录（推荐）
+        keyframes, temp_dir = extract_keyframes(video_path, 10)
+        try:
+            # 使用关键帧...
+            pass
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        # 使用指定目录
+        keyframes, _ = extract_keyframes(video_path, 10, output_dir="/custom/dir")
     """
     keyframe_paths: List[str] = []
     cap = None
+    use_temp_dir = output_dir is None
+    
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             logger.error(f"Could not open video for keyframe extraction: {video_path}")
-            return []
+            return [], None
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
 
         if total_frames == 0 or num_frames == 0:
             logger.warning(f"Video {video_path} has 0 frames or num_frames is 0. Skipping extraction.")
-            return []
+            return [], None
 
-        # Calculate interval for frame extraction
-        # We'll try to get frames spread across the video duration
-        # If video is very short, we might get frames from the beginning
         interval = max(1, total_frames // num_frames) if num_frames > 0 else total_frames
-
         frame_indices = list(range(0, total_frames, interval))[:num_frames]
 
-        output_dir = os.path.join(settings.output_json_directory, "temp_keyframes")
-        os.makedirs(output_dir, exist_ok=True)
+        # 创建输出目录
+        if use_temp_dir:
+            output_dir = tempfile.mkdtemp(prefix="keyframes_")
+            logger.debug(f"Created temporary directory: {output_dir}")
+        else:
+            if output_dir is None:
+                output_dir = tempfile.mkdtemp(prefix="keyframes_")
+                use_temp_dir = True
+            else:
+                os.makedirs(output_dir, exist_ok=True)
 
         for i, frame_idx in enumerate(frame_indices):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if ret:
-                keyframe_filename = f"keyframe_{Path(video_path).stem}_{i+1:03d}.jpg"
+                # 使用唯一文件名，避免并发冲突
+                video_hash = hashlib.md5(video_path.encode()).hexdigest()[:8]
+                keyframe_filename = f"keyframe_{video_hash}_{i+1:03d}.jpg"
                 keyframe_path = os.path.join(output_dir, keyframe_filename)
                 cv2.imwrite(keyframe_path, frame)
                 keyframe_paths.append(keyframe_path)
             else:
                 logger.warning(f"Could not read frame at index {frame_idx} from {video_path}")
+        
+        logger.info(f"Extracted {len(keyframe_paths)} keyframes to {output_dir}")
+        return keyframe_paths, output_dir if use_temp_dir else None
+        
     except cv2.error as e:
         logger.error(f"OpenCV error during keyframe extraction for {video_path}: {e}")
+        return [], None
     except Exception as e:
         logger.error(f"Unexpected error during keyframe extraction for {video_path}: {e}")
+        return [], None
     finally:
         if cap is not None:
             cap.release()
-    return keyframe_paths
 
 def process_video_file(video_path: str) -> Dict[str, Any]:
     """
-    Processes a single video file: extracts info, checks for abnormalities, and extracts keyframes.
-    This is the main function to call for each video.
-
+    处理单个视频文件
+    
     Args:
-        video_path: The absolute or relative path to the video file.
-
+        video_path: 视频文件路径
+    
     Returns:
-        A dictionary containing:
-        - "file_path": Original video path.
-        - "is_abnormal": Boolean indicating if the video is abnormal.
-        - "abnormality_reason": Reason for abnormality, if applicable.
-        - "duration_seconds": Video duration, or None if abnormal.
-        - "keyframe_paths": List of paths to extracted keyframes, or empty list if abnormal or failed.
-        - "video_info": Raw video info dictionary.
+        处理结果字典，包含：
+        - file_path: 视频文件路径
+        - is_abnormal: 是否异常
+        - abnormality_reason: 异常原因
+        - duration_seconds: 视频时长
+        - keyframe_paths: 关键帧路径列表
+        - temp_dir: 临时目录路径（需要调用者清理）
+        - video_info: 视频信息
     """
     result: Dict[str, Any] = {
         "file_path": video_path,
@@ -166,6 +200,7 @@ def process_video_file(video_path: str) -> Dict[str, Any]:
         "abnormality_reason": None,
         "duration_seconds": None,
         "keyframe_paths": [],
+        "temp_dir": None,
         "video_info": {},
     }
 
@@ -182,26 +217,21 @@ def process_video_file(video_path: str) -> Dict[str, Any]:
 
     if is_abnormal:
         logger.warning(f"Video {video_path} is abnormal. Reason: {reason}")
-        # No keyframes extracted for abnormal videos
         return result
 
     # Step 3: Extract keyframes (only if not abnormal)
     duration = video_info.get("duration_seconds", 0)
-    # Adjust keyframe count based on duration for very short videos
-    effective_num_frames = min(settings.keyframe_extract_count, max(1, int(duration / 2))) # At least 1 frame if duration > 0
+    effective_num_frames = min(settings.keyframe_extract_count, max(1, int(duration / 2)))
     if duration < settings.min_video_duration_seconds * 2 and duration >= settings.min_video_duration_seconds:
-        # For videos just above the minimum, extract fewer frames
         effective_num_frames = max(1, settings.keyframe_extract_count // 2)
 
-
-    keyframes = extract_keyframes(video_path, effective_num_frames)
+    keyframes, temp_dir = extract_keyframes(video_path, effective_num_frames)
     result["keyframe_paths"] = keyframes
+    result["temp_dir"] = temp_dir
     result["duration_seconds"] = duration
 
     if not keyframes and not is_abnormal:
         logger.warning(f"Failed to extract keyframes for {video_path}, though video was not marked abnormal.")
-        # This might indicate another issue, but we don't mark it as abnormal unless duration check fails.
-        # The AI analyzer might still struggle with no frames.
 
     logger.info(f"Successfully processed video: {video_path}. Extracted {len(keyframes)} keyframes.")
     return result
@@ -243,12 +273,14 @@ if __name__ == '__main__':
     os.makedirs(test_input_dir, exist_ok=True)
     os.makedirs(os.path.join(test_output_dir, "temp_keyframes"), exist_ok=True)
 
+    # Define fourcc codec for test videos
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # type: ignore
+
     # If no videos in input, create a dummy one for testing
     dummy_video_path = os.path.join(test_input_dir, "dummy_video.mp4")
     if not os.path.exists(dummy_video_path):
         logger.info("Creating a dummy video for testing...")
         # Create a dummy video using OpenCV (requires FFmpeg backend)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(dummy_video_path, fourcc, 20.0, (640, 480))
         for i in range(100): # 100 frames
             frame = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)

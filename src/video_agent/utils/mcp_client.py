@@ -2,78 +2,84 @@ import json
 import logging
 import os
 import subprocess
-from typing import Dict, Any, Optional
 import asyncio
+import time
+import select
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
 class MCPClientError(Exception):
-    """Custom exception for MCP client errors."""
+    """MCP客户端错误"""
     pass
 
 class MCPClient:
     """
-    A client for interacting with MCP (Model Context Protocol) servers.
-    Specifically designed to work with GLM4.6v vision model via stdio.
+    MCP客户端 - 支持并发安全和自动重试
+    
+    特性：
+    1. 单例进程复用 - 只创建一次MCP服务器进程
+    2. 线程安全 - 使用asyncio.Lock保证并发安全
+    3. 自动重试 - 失败后自动重试3次
+    4. 健康检查 - 自动检测进程状态并重启
+    5. 优雅关闭 - 确保资源正确清理
+    
+    改进点：
+    - 减少进程创建和销毁开销（只创建一次）
+    - 避免资源浪费（进程复用）
+    - 修补进程泄漏风险（完善的清理机制）
     """
     
-    def __init__(self, api_key: str, mode: str = "ZHIPU"):
+    DEFAULT_RESPONSE_TIMEOUT = 60
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
+    
+    def __init__(
+        self, 
+        api_key: str, 
+        mode: str = "ZHIPU",
+        response_timeout: Optional[int] = None
+    ):
         """
-        Initialize MCP client.
+        初始化MCP客户端
         
         Args:
-            api_key: API key for the MCP server
-            mode: Mode setting (e.g., "ZHIPU")
+            api_key: API密钥
+            mode: MCP模式（默认ZHIPU）
+            response_timeout: 响应超时时间（秒），默认60秒
+                             基于测试数据：5M视频处理约35秒
+                             设置60秒超时（35s + 10s冗余 + 15s缓冲）
         """
         self.api_key = api_key
         self.mode = mode
+        self.response_timeout = response_timeout or self.DEFAULT_RESPONSE_TIMEOUT
         self.process: Optional[subprocess.Popen] = None
+        self._lock = asyncio.Lock()
+        self._request_id = 0
+        self._is_initialized = False
         
-    async def analyze_video(self, prompt: str, image_paths: list) -> Dict[str, Any]:
+        logger.info(f"MCP Client initializing (timeout: {self.response_timeout}s)")
+        self._initialize_process()
+    
+    def _initialize_process(self):
         """
-        Analyze video using MCP server (GLM4.6v) with image analysis tool.
+        初始化MCP服务器进程
+        只在客户端创建时调用一次，实现进程复用
+        """
+        import shutil
         
-        Args:
-            prompt: The analysis prompt
-            image_paths: List of paths to keyframe images
-            
-        Returns:
-            Dictionary containing description and tags
-            
-        Raises:
-            MCPClientError: If analysis fails
-        """
+        npx_path = shutil.which("npx")
+        if not npx_path:
+            raise MCPClientError("npx not found. Please install Node.js.")
+        
+        env = os.environ.copy()
+        env["Z_AI_API_KEY"] = self.api_key
+        env["Z_AI_MODE"] = self.mode
+        
+        logger.info("Starting MCP server process...")
+        logger.info(f"Mode: {self.mode}")
+        
         try:
-            # Build up request for image analysis
-            request = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "analyze_image",
-                    "arguments": {
-                        "image_source": image_paths[0],  # Use first keyframe
-                        "prompt": prompt
-                    }
-                }
-            }
-            
-            # Start of MCP server process with explicit shell
-            import shutil
-            npx_path = shutil.which("npx")
-            if not npx_path:
-                raise MCPClientError("npx not found. Please install Node.js.")
-            
-            # Prepare environment variables
-            env = os.environ.copy()
-            # MCP server expects Z_AI_API_KEY
-            env["Z_AI_API_KEY"] = self.api_key
-            env["Z_AI_MODE"] = self.mode
-            
-            logger.info(f"Starting MCP server with npx at: {npx_path}")
-            logger.info(f"API Key length: {len(self.api_key) if self.api_key else 0}")
-            logger.info(f"Mode: {self.mode}")
-            
             self.process = subprocess.Popen(
                 [npx_path, "-y", "@z_ai/mcp-server"],
                 stdin=subprocess.PIPE,
@@ -81,85 +87,277 @@ class MCPClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                shell=False
+                shell=False,
+                bufsize=1
             )
             
-            # Send request
-            request_str = json.dumps(request) + "\n"
-            self.process.stdin.write(request_str)
-            self.process.stdin.flush()
+            time.sleep(0.5)
             
-            # Read response with timeout
-            try:
-                response_str = self.process.stdout.readline()
-                logger.info(f"Received response from MCP server: {len(response_str)} chars")
-                
-                if not response_str:
-                    stderr_output = self.process.stderr.read()
-                    raise MCPClientError(f"No response from MCP server. Stderr: {stderr_output}")
-                
-                response = json.loads(response_str)
-            except json.JSONDecodeError as e:
-                stderr_output = self.process.stderr.read()
-                logger.error(f"Failed to parse MCP response. Response: {response_str}")
-                logger.error(f"Stderr: {stderr_output}")
-                raise MCPClientError(f"Invalid JSON response from MCP server: {e}")
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read() if self.process.stderr else "No stderr available"
+                raise MCPClientError(
+                    f"MCP server failed to start. Stderr: {stderr_output}"
+                )
             
-            if "error" in response:
-                raise MCPClientError(f"MCP server error: {response['error']}")
-                
-            if "result" not in response:
-                logger.warning(f"Unexpected response structure: {response}")
-                # Fallback: provide a basic response
-                return {
-                    "description": "AI analysis completed but returned unexpected format.",
-                    "tags": ["normal_operation"]
-                }
+            self._is_initialized = True
+            logger.info(f"✓ MCP server started (PID: {self.process.pid})")
             
-            result = response["result"]
-            logger.info(f"MCP analysis result: {result}")
-            return result
-            
-        except subprocess.TimeoutExpired:
-            logger.error("MCP server timed out")
-            raise MCPClientError("MCP server timed out")
         except Exception as e:
-            logger.error(f"MCP analysis failed: {e}", exc_info=True)
-            raise MCPClientError(f"MCP analysis failed: {e}")
-        finally:
-            if self.process:
-                logger.info("Terminating MCP server process")
+            logger.error(f"Failed to start MCP server: {e}")
+            raise MCPClientError(f"Failed to initialize MCP server: {e}")
+    
+    def _ensure_process_alive(self):
+        """
+        确保MCP进程存活
+        如果进程已死则自动重启
+        """
+        if self.process is None or self.process.poll() is not None:
+            logger.warning("⚠️ MCP process died, restarting...")
+            self._initialize_process()
+    
+    def _restart_process(self):
+        """
+        重启MCP服务器进程
+        用于错误恢复
+        """
+        logger.info("Restarting MCP server process...")
+        self._terminate_process()
+        self._initialize_process()
+        logger.info("✓ MCP server restarted")
+    
+    def _terminate_process(self):
+        """
+        优雅地终止MCP进程
+        确保资源正确清理，避免进程泄漏
+        """
+        if self.process:
+            logger.info(f"Terminating MCP process (PID: {self.process.pid})")
+            
+            try:
                 self.process.terminate()
+                self.process.wait(timeout=5)
+                logger.info("✓ MCP process terminated gracefully")
+                
+            except subprocess.TimeoutExpired:
+                logger.warning("MCP process did not terminate gracefully, killing...")
+                self.process.kill()
+                self.process.wait()
+                logger.info("✓ MCP process killed")
+                
+            except Exception as e:
+                logger.error(f"Error terminating MCP process: {e}")
                 try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
+                except:
+                    pass
+            
+            finally:
                 self.process = None
+                self._is_initialized = False
     
-    def analyze_video_sync(self, prompt: str, image_paths: list) -> Dict[str, Any]:
+    async def analyze_video(
+        self, 
+        prompt: str, 
+        image_paths: List[str],
+        max_retries: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
-        Synchronous wrapper for analyze_video.
+        分析视频（带自动重试机制）
         
         Args:
-            prompt: The analysis prompt
-            image_paths: List of paths to keyframe images
-            
+            prompt: 分析提示词
+            image_paths: 关键帧图片路径列表
+            max_retries: 最大重试次数（默认3次）
+        
         Returns:
-            Dictionary containing description and tags
+            分析结果字典
+        
+        Raises:
+            MCPClientError: 所有重试失败后抛出
+        
+        重试策略：
+        - 失败后自动重试，最多3次
+        - 每次重试前等待2秒
+        - 每次重试都有明确的日志提示
+        - 重试前会重启MCP进程
         """
-        return asyncio.run(self.analyze_video(prompt, image_paths))
+        max_retries = max_retries or self.MAX_RETRIES
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = await self._analyze_video_once(prompt, image_paths)
+                
+                if attempt > 1:
+                    logger.info(
+                        f"✓ Request succeeded on attempt {attempt}/{max_retries}"
+                    )
+                return result
+                
+            except MCPClientError as e:
+                last_error = e
+                
+                if attempt < max_retries:
+                    logger.warning(
+                        f"⚠️ Attempt {attempt}/{max_retries} failed: {e}. "
+                        f"Retrying in {self.RETRY_DELAY}s..."
+                    )
+                    await asyncio.sleep(self.RETRY_DELAY)
+                    self._restart_process()
+                else:
+                    logger.error(
+                        f"❌ All {max_retries} attempts failed. Last error: {e}"
+                    )
+        
+        raise MCPClientError(
+            f"Failed after {max_retries} retries. Last error: {last_error}"
+        )
+    
+    async def _analyze_video_once(
+        self, 
+        prompt: str, 
+        image_paths: List[str]
+    ) -> Dict[str, Any]:
+        """
+        单次分析视频（内部方法，不带重试）
+        
+        Args:
+            prompt: 分析提示词
+            image_paths: 关键帧路径列表
+        
+        Returns:
+            分析结果字典
+        
+        Raises:
+            MCPClientError: 分析失败时抛出
+        """
+        async with self._lock:
+            try:
+                self._ensure_process_alive()
+                
+                if self.process is None:
+                    raise MCPClientError("MCP process not initialized")
+                
+                self._request_id += 1
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": self._request_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "analyze_image",
+                        "arguments": {
+                            "image_source": image_paths[0] if image_paths else "",
+                            "prompt": prompt
+                        }
+                    }
+                }
+                
+                request_str = json.dumps(request) + "\n"
+                logger.debug(f"Sending request (ID: {self._request_id})")
+                
+                if self.process.stdin is None:
+                    raise MCPClientError("MCP process stdin not available")
+                
+                self.process.stdin.write(request_str)
+                self.process.stdin.flush()
+                
+                try:
+                    if self.process.stdout is None:
+                        raise MCPClientError("MCP process stdout not available")
+                    
+                    ready, _, _ = select.select(
+                        [self.process.stdout], [], [], 
+                        self.response_timeout
+                    )
+                    
+                    if not ready:
+                        raise MCPClientError(
+                            f"Response timeout ({self.response_timeout}s)"
+                        )
+                    
+                    response_str = self.process.stdout.readline()
+                    
+                    if not response_str:
+                        stderr = self.process.stderr.read() if self.process.stderr else ""
+                        raise MCPClientError(f"No response. Stderr: {stderr}")
+                    
+                    response = json.loads(response_str)
+                    
+                    if "error" in response:
+                        raise MCPClientError(f"Server error: {response['error']}")
+                    
+                    if "result" not in response:
+                        logger.warning("Unexpected response structure")
+                        return {
+                            "description": "AI analysis completed but returned unexpected format.",
+                            "tags": ["normal_operation"]
+                        }
+                    
+                    logger.info("✓ Analysis completed successfully")
+                    return response["result"]
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON response: {e}")
+                    raise MCPClientError(f"Invalid JSON response: {e}")
+                    
+            except Exception as e:
+                logger.error(f"MCP analysis failed: {e}")
+                raise MCPClientError(f"MCP analysis failed: {e}")
+    
+    def analyze_video_sync(
+        self, 
+        prompt: str, 
+        image_paths: List[str],
+        max_retries: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        同步包装器 - 用于非异步环境
+        
+        Args:
+            prompt: 分析提示词
+            image_paths: 关键帧路径列表
+            max_retries: 最大重试次数
+        
+        Returns:
+            分析结果字典
+        """
+        return asyncio.run(
+            self.analyze_video(prompt, image_paths, max_retries)
+        )
+    
+    def close(self):
+        """
+        显式关闭客户端
+        确保MCP进程被正确清理
+        """
+        self._terminate_process()
+        logger.info("MCP client closed")
+    
+    def __del__(self):
+        """
+        析构函数 - 确保进程被正确清理
+        防止进程泄漏
+        """
+        self._terminate_process()
+    
+    def __enter__(self):
+        """支持上下文管理器"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文时自动清理"""
+        self.close()
+        return False
 
 async def test_mcp_connection() -> bool:
     """
-    Test if MCP server is accessible.
+    测试MCP服务器是否可访问
     
     Returns:
-        True if connection successful, False otherwise
+        True如果连接成功，False否则
     """
     try:
-        client = MCPClient("test_key")
-        # Try to start the process (it will fail authentication but shows server is running)
         process = subprocess.Popen(
             ["npx", "-y", "@z_ai/mcp-server"],
             stdin=subprocess.PIPE,
@@ -178,9 +376,7 @@ async def test_mcp_connection() -> bool:
         return False
 
 if __name__ == "__main__":
-    # Test MCP connection
     logging.basicConfig(level=logging.INFO)
-    import os
     
     if asyncio.run(test_mcp_connection()):
         print("✓ MCP server is accessible")

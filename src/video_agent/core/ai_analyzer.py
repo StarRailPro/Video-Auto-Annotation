@@ -1,6 +1,7 @@
 import os
 import logging
 import base64
+import json
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -15,6 +16,113 @@ logger = logging.getLogger(__name__)
 class AIAnalysisError(Exception):
     """Custom exception for AI analysis errors."""
     pass
+
+class MCPResponseParser:
+    """
+    MCP响应解析器
+    严格遵循MCP协议规范，支持多种响应格式
+    """
+    
+    @staticmethod
+    def parse(response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        解析MCP响应，支持多种格式
+        
+        处理流程：
+        1. 检查错误响应
+        2. 检查result字段
+        3. 检查content字段
+        4. 提取所有text内容
+        5. 尝试解析JSON
+        6. 降级到纯文本
+        
+        Args:
+            response: MCP响应字典
+        
+        Returns:
+            包含 description, tags, confidence_scores 的字典
+        """
+        if "error" in response:
+            error = response["error"]
+            error_msg = error.get("message", "Unknown error") if isinstance(error, dict) else str(error)
+            logger.error(f"MCP error response: {error_msg}")
+            return {
+                "description": f"MCP Error: {error_msg}",
+                "tags": [],
+                "confidence_scores": None
+            }
+        
+        if "result" not in response:
+            logger.warning("No 'result' field in response")
+            logger.debug(f"Response structure: {json.dumps(response, indent=2)}")
+            return {
+                "description": "No result in MCP response",
+                "tags": [],
+                "confidence_scores": None
+            }
+        
+        result = response["result"]
+        
+        if "content" not in result:
+            logger.warning("No 'content' field in result")
+            logger.debug(f"Result structure: {json.dumps(result, indent=2)}")
+            return {
+                "description": str(result) if result else "Empty result",
+                "tags": [],
+                "confidence_scores": None
+            }
+        
+        content = result["content"]
+        
+        if not isinstance(content, list):
+            logger.warning(f"Content is not a list: {type(content)}")
+            return {
+                "description": str(content),
+                "tags": [],
+                "confidence_scores": None
+            }
+        
+        text_contents = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if text:
+                    text_contents.append(text)
+        
+        if not text_contents:
+            logger.warning("No text content found in MCP response")
+            logger.debug(f"Content structure: {json.dumps(content, indent=2)}")
+            return {
+                "description": "No text content in MCP response",
+                "tags": [],
+                "confidence_scores": None
+            }
+        
+        combined_text = "\n".join(text_contents)
+        logger.info(f"Combined text content ({len(combined_text)} chars): {combined_text[:200]}...")
+        
+        try:
+            parsed = json.loads(combined_text)
+            description = parsed.get("description", "")
+            tags = parsed.get("tags", [])
+            confidence_scores = parsed.get("confidence_scores")
+            
+            logger.info(f"Successfully parsed JSON response")
+            logger.info(f"Description: {description[:100]}...")
+            logger.info(f"Tags: {tags}")
+            
+            return {
+                "description": description,
+                "tags": tags if isinstance(tags, list) else [],
+                "confidence_scores": confidence_scores
+            }
+        except json.JSONDecodeError as e:
+            logger.info(f"Response is not JSON, using as plain text: {e}")
+            return {
+                "description": combined_text,
+                "tags": [],
+                "confidence_scores": None
+            }
 
 def encode_image(image_path: str) -> str:
     """
@@ -41,7 +149,6 @@ def analyze_with_mcp(
     Returns:
         Dictionary with analysis results
     """
-    # Prepare prompt
     prompt = PROMPT_TEMPLATE.format(
         duration_seconds=video_data.get("duration_seconds", "N/A"),
         is_abnormal=str(video_data.get("is_abnormal", False)),
@@ -49,7 +156,6 @@ def analyze_with_mcp(
         predefined_tags=", ".join(TagEnum.get_all_values())
     )
 
-    # Get image paths (MCP handles base64 encoding internally)
     image_paths = video_data.get("keyframe_paths", [])
     
     if not image_paths and not video_data.get("is_abnormal"):
@@ -59,45 +165,13 @@ def analyze_with_mcp(
         logger.info(f"Sending MCP request for: {video_data['file_path']}")
         result = client.analyze_video_sync(prompt, image_paths)
         
-        # Parse MCP response - it's in nested format
-        # Result format: {'content': [{'type': 'text', 'text': '{"description": "...", "tags": [...]}'}]}
-        import json as json_parser
+        parsed_result = MCPResponseParser.parse(result)
         
-        description = ""
-        tags = []
-        
-        # Extract text content from nested structure
-        if "content" in result and len(result["content"]) > 0:
-            content = result["content"][0]
-            if content.get("type") == "text":
-                text_content = content.get("text", "")
-                logger.info(f"Raw text content from MCP: {text_content[:200]}...")
-                
-                # Try to parse JSON from the text content
-                try:
-                    parsed_json = json_parser.loads(text_content)
-                    description = parsed_json.get("description", "")
-                    tags = parsed_json.get("tags", [])
-                    logger.info(f"Parsed description: {description[:100]}...")
-                    logger.info(f"Parsed tags: {tags}")
-                except json_parser.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON from MCP response: {e}")
-                    # Fallback: use the text content as description
-                    description = text_content.strip()
-                    tags = []
-        
-        # Fallback if no content
-        if not description:
-            description = result.get("description", "")
-            tags = result.get("tags", [])
-        
-        api_response_payload: APIResponsePayload = {
-            "description": description,
-            "tags": tags,
-            "confidence_scores": result.get("confidence_scores")
+        return {
+            "description": parsed_result["description"],
+            "tags": parsed_result["tags"],
+            "confidence_scores": parsed_result.get("confidence_scores")
         }
-        
-        return api_response_payload
         
     except MCPClientError as e:
         logger.error(f"MCP error: {e}")
