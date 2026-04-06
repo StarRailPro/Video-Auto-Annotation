@@ -240,39 +240,7 @@ Processing Videos: 100%|██████████| 100/100 [10:23<00:00,  6
 ### 问题：处理缓慢
 **解决方案**：使用 `--workers` 增加工作线程数或在配置中减少 `KEYFRAME_EXTRACT_COUNT`
 
-## 开发
 
-### 运行测试
-
-```bash
-pytest tests/
-```
-
-### 代码风格
-
-项目使用：
-- **Black** 用于代码格式化
-- **Flake8** 用于代码检查
-- **Mypy** 用于类型检查
-
-运行所有检查：
-```bash
-black src/video_agent/
-flake8 src/video_agent/
-mypy src/video_agent/
-```
-
-## 贡献
-
-欢迎贡献！请确保：
-1. 代码遵循现有风格
-2. 所有测试通过
-3. 新功能包含适当的测试
-4. 文档已更新
-
-## 许可证
-
-[在此指定您的许可证]
 
 ## 联系
 
