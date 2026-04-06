@@ -1,0 +1,28 @@
+# Video and Image Processing
+opencv-python>=4.8.0
+ffmpeg-python>=0.2.0
+
+# Data Validation, Settings, and Serialization
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Progress Bar
+tqdm>=4.65.0
+
+# Logging (Python's built-in logging module is used, no extra package needed)
+
+# For development and testing (optional but recommended)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+
+# MCP Support
+# Note: MCP (GLM4.6v) requires Node.js and npm to be installed separately
+# MCP server (@z_ai/mcp-server) is installed via npm, not pip
+# Install Node.js from: https://nodejs.org/
+# MCP server is automatically started using npx -y @z_ai/mcp-server
+
+# Additional dependencies for enhanced functionality
+python-dotenv>=1.0.0  # For loading .env files (if not already included)

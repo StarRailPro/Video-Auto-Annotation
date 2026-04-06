@@ -1,0 +1,15 @@
+{
+    "total_videos_processed": 1,
+    "successful_annotations": 0,
+    "failed_annotations": 1,
+    "annotations": [
+        {
+            "file_path": "data/input\\test_video.mp4",
+            "description": "AI Analysis Failed",
+            "tags": [
+                "abnormal_video"
+            ],
+            "duration_seconds": null,
+            "is_abnormal": true,
+            "abnormality_reason": "AI Analysis Error: MCP error: MCP analysis failed: No response from MCP server. Stderr: [2026-03-28T08:01:01.556Z] ERROR: Application startup failed: [{\"message\":\"Z_AI_API_KEY environment variable is required, please set your actual API key\"}]\n",
+            "processing_timestamp": 
