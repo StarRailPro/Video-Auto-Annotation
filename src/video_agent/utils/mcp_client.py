@@ -4,8 +4,10 @@ import os
 import subprocess
 import asyncio
 import time
-import select
+import sys
+import threading
 from typing import Dict, Any, Optional, List
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,15 @@ class MCPClient:
         npx_path = shutil.which("npx")
         if not npx_path:
             raise MCPClientError("npx not found. Please install Node.js.")
+        
+        log_dir = Path.home() / ".zai"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        from datetime import datetime
+        log_file = log_dir / f"zai-mcp-{datetime.now().strftime('%Y-%m-%d')}.log"
+        if not log_file.exists():
+            with open(log_file, 'w') as f:
+                f.write('')
         
         env = os.environ.copy()
         env["Z_AI_API_KEY"] = self.api_key
@@ -266,17 +277,28 @@ class MCPClient:
                     if self.process.stdout is None:
                         raise MCPClientError("MCP process stdout not available")
                     
-                    ready, _, _ = select.select(
-                        [self.process.stdout], [], [], 
-                        self.response_timeout
-                    )
+                    stdout = self.process.stdout
+                    response_str = None
+                    read_error = None
                     
-                    if not ready:
+                    def read_with_timeout():
+                        nonlocal response_str, read_error
+                        try:
+                            response_str = stdout.readline()
+                        except Exception as e:
+                            read_error = e
+                    
+                    read_thread = threading.Thread(target=read_with_timeout, daemon=True)
+                    read_thread.start()
+                    read_thread.join(timeout=self.response_timeout)
+                    
+                    if read_thread.is_alive():
                         raise MCPClientError(
                             f"Response timeout ({self.response_timeout}s)"
                         )
                     
-                    response_str = self.process.stdout.readline()
+                    if read_error:
+                        raise MCPClientError(f"Read error: {read_error}")
                     
                     if not response_str:
                         stderr = self.process.stderr.read() if self.process.stderr else ""
