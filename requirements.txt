@@ -1,6 +1,9 @@
+# Core Dependencies
+# =================
+
 # Video and Image Processing
 opencv-python>=4.8.0
-ffmpeg-python>=0.2.0
+numpy>=1.24.0
 
 # Data Validation, Settings, and Serialization
 pydantic>=2.0.0
@@ -12,20 +15,31 @@ cryptography>=41.0.0
 # Progress Bar
 tqdm>=4.65.0
 
-# Logging (Python's built-in logging module is used, no extra package needed)
+# Environment Variables
+python-dotenv>=1.0.0
 
-# For development and testing (optional but recommended)
+# Development and Testing
+# =======================
 pytest>=7.0.0
 pytest-cov>=4.0.0
+
+# Code Quality (optional)
 black>=23.0.0
 flake8>=6.0.0
 mypy>=1.0.0
 
+# Web Application (FastAPI Backend)
+# =================================
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+sqlalchemy>=2.0.0
+python-multipart>=0.0.6
+aiofiles>=23.0.0
+websockets>=11.0
+
 # MCP Support
+# ===========
 # Note: MCP (GLM4.6v) requires Node.js and npm to be installed separately
 # MCP server (@z_ai/mcp-server) is installed via npm, not pip
 # Install Node.js from: https://nodejs.org/
 # MCP server is automatically started using npx -y @z_ai/mcp-server
-
-# Additional dependencies for enhanced functionality
-python-dotenv>=1.0.0  # For loading .env files (if not already included)
